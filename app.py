@@ -624,7 +624,7 @@ Scenario: {name}
 - Seasonal adjustment: {'Yes — ' + ('Peak' if inp['is_peak'] else 'Off-peak') if inp['apply_seasonal'] else 'No'}
 - Price trend: {inp['price_trend']} ({inp['price_chg']}% change expected)
 - Obsolescence risk: {inp['obs_risk'] if inp['apply_obs'] else 'Not applied'}
-- Dead stock: {inp['dead_units']} units ({inp['dead_months']} months idle) if inp['apply_dead'] else 'Not applied'
+- Dead stock: {inp['dead_units'] if inp['apply_dead'] else 'Not applied'} units ({inp['dead_months'] if inp['apply_dead'] else 'N/A'} months idle)
 - Warehouse capacity: {inp['warehouse_cap'] if inp['warehouse_cap'] > 0 else 'No limit'}
 - Budget per order: ${inp['budget_limit'] if inp['budget_limit'] > 0 else 'No limit'}
 """
