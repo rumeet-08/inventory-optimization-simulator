@@ -4,641 +4,827 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import google.generativeai as genai
 import math
+import io
+from groq import Groq
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
-# ── Page config
+# ── Your Groq API key — hardcoded, users never see it
+GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+
+# ════════════════════════════════════════════
+# PAGE CONFIG
+# ════════════════════════════════════════════
 st.set_page_config(
-    page_title="Inventory Optimization Simulator",
-    page_icon="📦",
+    page_title="Pharma Inventory Optimizer",
+    page_icon="💊",
     layout="wide"
 )
 
-# ── Custom CSS
 st.markdown("""
 <style>
-  .main-title { font-size: 2rem; font-weight: 700; color: #1a1a2e; margin-bottom: 0; }
-  .sub-title  { font-size: 1rem; color: #666; margin-bottom: 2rem; }
+  .main-title { font-size: 2rem; font-weight: 700; color: #1a1a2e; }
+  .sub-title { font-size: 0.95rem; color: #666; margin-bottom: 1.5rem; }
   .metric-card {
     background: #f8f9ff;
     border: 1px solid #e0e4ff;
-    border-radius: 12px;
-    padding: 1rem 1.2rem;
+    border-radius: 10px;
+    padding: 0.9rem 1.1rem;
     margin-bottom: 0.5rem;
   }
-  .metric-label { font-size: 0.75rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em; }
-  .metric-value { font-size: 1.5rem; font-weight: 700; color: #1a1a2e; }
-  .metric-unit  { font-size: 0.8rem; color: #888; }
-  .winner-card {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    border-radius: 12px;
-    padding: 1.5rem;
-    color: white;
-    margin-bottom: 1rem;
-  }
+  .metric-label { font-size: 0.72rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em; }
+  .metric-value { font-size: 1.4rem; font-weight: 700; color: #1a1a2e; }
+  .metric-unit { font-size: 0.75rem; color: #888; }
   .section-header {
-    font-size: 1.1rem;
+    font-size: 1rem;
     font-weight: 600;
     color: #1a1a2e;
     border-left: 4px solid #667eea;
     padding-left: 0.75rem;
-    margin: 1.5rem 0 1rem;
+    margin: 1.2rem 0 0.8rem;
   }
-  .warning-box {
-    background: #fff8e1;
-    border: 1px solid #ffcc02;
-    border-radius: 8px;
-    padding: 0.75rem 1rem;
-    font-size: 0.875rem;
-    color: #7a5c00;
-    margin-bottom: 0.5rem;
-  }
-  .info-box {
-    background: #e8f4fd;
-    border: 1px solid #90caf9;
-    border-radius: 8px;
-    padding: 0.75rem 1rem;
-    font-size: 0.875rem;
-    color: #0d47a1;
-    margin-bottom: 0.5rem;
-  }
+  .risk-high { background: #fff0f0; border: 1px solid #ffcccc; border-radius: 8px; padding: 0.6rem 1rem; font-size: 0.85rem; color: #cc0000; margin-bottom: 0.4rem; }
+  .risk-med  { background: #fffbf0; border: 1px solid #ffe0a0; border-radius: 8px; padding: 0.6rem 1rem; font-size: 0.85rem; color: #996600; margin-bottom: 0.4rem; }
+  .risk-low  { background: #f0fff4; border: 1px solid #b0f0c0; border-radius: 8px; padding: 0.6rem 1rem; font-size: 0.85rem; color: #006620; margin-bottom: 0.4rem; }
   .stButton > button {
     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    color: white;
-    border: none;
-    border-radius: 8px;
-    padding: 0.6rem 2rem;
-    font-size: 1rem;
-    font-weight: 600;
-    width: 100%;
+    color: white; border: none; border-radius: 8px;
+    padding: 0.6rem 2rem; font-size: 1rem; font-weight: 600; width: 100%;
+  }
+  .upload-box {
+    background: #f8f9ff; border: 2px dashed #667eea;
+    border-radius: 12px; padding: 2rem; text-align: center;
+    margin: 1rem 0;
+  }
+  .scenario-winner {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    border-radius: 10px; padding: 0.8rem 1.2rem;
+    color: white; font-weight: 600; font-size: 0.9rem;
+    margin-bottom: 0.5rem;
   }
 </style>
 """, unsafe_allow_html=True)
 
 # ════════════════════════════════════════════
-# CORE CALCULATION FUNCTIONS
+# CORE MATH FUNCTIONS
 # ════════════════════════════════════════════
+Z_SCORES = {90: 1.28, 95: 1.645, 97: 1.88, 99: 2.326}
+
+def to_annual(monthly_val):
+    return monthly_val * 12
 
 def calc_eoq(annual_demand, order_cost, holding_cost_per_unit):
     if holding_cost_per_unit <= 0 or annual_demand <= 0:
         return 0
     return math.sqrt((2 * annual_demand * order_cost) / holding_cost_per_unit)
 
-def calc_safety_stock(z_score, demand_std, lead_time_avg, lead_time_std, daily_demand):
-    demand_variability   = (z_score ** 2) * (lead_time_avg) * (demand_std ** 2)
-    lead_time_variability = (z_score ** 2) * (daily_demand ** 2) * (lead_time_std ** 2)
-    return math.sqrt(demand_variability + lead_time_variability)
+def calc_safety_stock(z, demand_std_daily, lead_time_avg, lead_time_std, daily_demand):
+    part1 = (z ** 2) * lead_time_avg * (demand_std_daily ** 2)
+    part2 = (z ** 2) * (daily_demand ** 2) * (lead_time_std ** 2)
+    return math.sqrt(part1 + part2)
 
-def calc_reorder_point(daily_demand, lead_time_avg, safety_stock):
-    return (daily_demand * lead_time_avg) + safety_stock
-
-def calc_total_cost(annual_demand, eoq, order_cost, holding_cost_per_unit, safety_stock):
-    if eoq <= 0:
-        return 0
-    order_cost_annual   = (annual_demand / eoq) * order_cost
-    holding_cost_annual = ((eoq / 2) + safety_stock) * holding_cost_per_unit
-    return order_cost_annual + holding_cost_annual
-
-def apply_seasonal_adjustment(base_demand, is_peak, peak_multiplier, offpeak_multiplier):
-    return base_demand * (peak_multiplier if is_peak else offpeak_multiplier)
-
-def apply_supplier_risk_buffer(safety_stock, num_suppliers, reliability_pct):
+def calc_supplier_risk_factor(num_suppliers, reliability_pct):
     if num_suppliers == 1:
-        risk_factor = 1 + ((100 - reliability_pct) / 100) * 1.5
+        return 1 + ((100 - reliability_pct) / 100) * 1.5
     elif num_suppliers == 2:
-        risk_factor = 1 + ((100 - reliability_pct) / 100) * 0.8
+        return 1 + ((100 - reliability_pct) / 100) * 0.8
     else:
-        risk_factor = 1 + ((100 - reliability_pct) / 100) * 0.4
-    return safety_stock * risk_factor
+        return 1 + ((100 - reliability_pct) / 100) * 0.4
 
-def apply_price_volatility_adjustment(eoq, price_trend, price_change_pct):
-    if price_trend == "Rising":
-        return eoq * (1 + price_change_pct / 200)
-    elif price_trend == "Falling":
-        return eoq * (1 - price_change_pct / 300)
-    return eoq
+def run_sku(row):
+    results = {}
 
-def calc_obsolescence_cap(shelf_life_days, daily_demand):
-    return shelf_life_days * daily_demand * 0.8
+    # ── Parse required fields
+    monthly_demand   = float(row["Monthly_Demand"])
+    unit_cost        = float(row["Unit_Cost_USD"])
+    order_cost       = float(row["Order_Cost_USD"])
+    lead_time_avg    = float(row["Lead_Time_Days"])
+    num_suppliers    = int(row["Num_Suppliers"])
+    reliability      = float(row["Supplier_Reliability_Pct"])
+    service_level    = float(row["Service_Level_Pct"])
 
-def calc_working_capital_cost(dead_stock_units, unit_cost, holding_cost_pct):
-    return dead_stock_units * unit_cost * (holding_cost_pct / 100)
+    # ── Parse optional fields with smart defaults
+    working_days_month = float(row.get("Working_Days_Month", 22)) if pd.notna(row.get("Working_Days_Month", np.nan)) else 22
+    monthly_hold_pct   = float(row.get("Monthly_Holding_Cost_Pct", 2.0)) if pd.notna(row.get("Monthly_Holding_Cost_Pct", np.nan)) else 2.0
+    daily_demand       = monthly_demand / working_days_month
+    demand_std         = float(row.get("Demand_Std_Dev", daily_demand * 0.2)) if pd.notna(row.get("Demand_Std_Dev", np.nan)) else daily_demand * 0.2
+    lead_time_std      = float(row.get("Lead_Time_Std_Dev", lead_time_avg * 0.2)) if pd.notna(row.get("Lead_Time_Std_Dev", np.nan)) else lead_time_avg * 0.2
+    moq                = float(row.get("MOQ", 0)) if pd.notna(row.get("MOQ", np.nan)) else 0
+    shelf_life         = float(row.get("Shelf_Life_Days", 9999)) if pd.notna(row.get("Shelf_Life_Days", np.nan)) else 9999
+    dead_stock         = float(row.get("Dead_Stock_Units", 0)) if pd.notna(row.get("Dead_Stock_Units", np.nan)) else 0
+    price_trend        = str(row.get("Price_Trend", "Stable")) if pd.notna(row.get("Price_Trend", np.nan)) else "Stable"
+    peak_mult          = float(row.get("Peak_Season_Multiplier", 1.0)) if pd.notna(row.get("Peak_Season_Multiplier", np.nan)) else 1.0
 
-# Z-score lookup
-Z_SCORES = {90: 1.28, 95: 1.645, 97: 1.88, 99: 2.326}
+    # ── Conversions
+    annual_demand        = to_annual(monthly_demand) * peak_mult
+    annual_hold_pct      = monthly_hold_pct * 12
+    holding_cost_per_unit = unit_cost * (annual_hold_pct / 100)
+    risk_factor          = calc_supplier_risk_factor(num_suppliers, reliability)
 
-def run_scenario(service_level, annual_demand, order_cost, unit_cost, holding_cost_pct,
-                 lead_time_avg, lead_time_std, demand_std, working_days,
-                 num_suppliers, reliability_pct,
-                 price_trend, price_change_pct,
-                 shelf_life_days, apply_obsolescence,
-                 dead_stock_units, apply_dead_stock,
-                 is_peak_season, peak_multiplier, offpeak_multiplier,
-                 moq, warehouse_cap, budget_limit):
+    # ── Price trend EOQ adjustment
+    price_adj = 1.0
+    if price_trend == "Rising":   price_adj = 1.075
+    elif price_trend == "Falling": price_adj = 0.93
 
-    z = Z_SCORES.get(service_level, 1.645)
-    holding_cost_per_unit = unit_cost * (holding_cost_pct / 100)
-    daily_demand = annual_demand / working_days
+    # ── Run 3 scenarios
+    for sl_name, sl_val in [("Conservative", 99), ("Balanced", 95), ("Lean", 90)]:
+        z   = Z_SCORES[sl_val]
+        eoq = calc_eoq(annual_demand, order_cost, holding_cost_per_unit) * price_adj
+        eoq = max(eoq, moq)
 
-    # Apply seasonal adjustment
-    adj_demand = apply_seasonal_adjustment(
-        annual_demand, is_peak_season, peak_multiplier, offpeak_multiplier)
-    adj_daily  = adj_demand / working_days
+        # Shelf life cap
+        if shelf_life < 9999:
+            max_qty = shelf_life * daily_demand * 0.8
+            eoq     = min(eoq, max_qty)
 
-    # EOQ
-    eoq = calc_eoq(adj_demand, order_cost, holding_cost_per_unit)
+        ss  = calc_safety_stock(z, demand_std, lead_time_avg, lead_time_std, daily_demand)
+        ss  = ss * risk_factor
 
-    # Price volatility adjustment
-    eoq = apply_price_volatility_adjustment(eoq, price_trend, price_change_pct)
+        rop = (daily_demand * lead_time_avg) + ss
 
-    # Enforce MOQ
-    eoq = max(eoq, moq)
+        hold_cost  = ((eoq / 2) + ss) * holding_cost_per_unit
+        order_cost_ann = (annual_demand / eoq) * order_cost if eoq > 0 else 0
+        wc_cost    = dead_stock * unit_cost * (annual_hold_pct / 100)
+        total_cost = hold_cost + order_cost_ann + wc_cost
+        orders_yr  = annual_demand / eoq if eoq > 0 else 0
 
-    # Obsolescence cap
-    if apply_obsolescence and shelf_life_days > 0:
-        obs_cap = calc_obsolescence_cap(shelf_life_days, adj_daily)
-        eoq = min(eoq, obs_cap)
+        results[sl_name] = {
+            "eoq":            round(eoq),
+            "safety_stock":   round(ss),
+            "reorder_point":  round(rop),
+            "holding_cost":   round(hold_cost, 2),
+            "order_cost_ann": round(order_cost_ann, 2),
+            "wc_cost":        round(wc_cost, 2),
+            "total_cost":     round(total_cost, 2),
+            "orders_per_year": round(orders_yr, 1),
+            "stockout_risk":  100 - sl_val,
+            "service_level":  sl_val,
+        }
 
-    # Safety stock
-    ss = calc_safety_stock(z, demand_std, lead_time_avg, lead_time_std, adj_daily)
+    # ── Pick best scenario
+    user_sl   = service_level
+    best_name = "Balanced"
+    if user_sl >= 97:   best_name = "Conservative"
+    elif user_sl >= 93: best_name = "Balanced"
+    else:               best_name = "Lean"
 
-    # Supplier risk buffer
-    ss = apply_supplier_risk_buffer(ss, num_suppliers, reliability_pct)
+    # Override if single supplier unreliable
+    if num_suppliers == 1 and reliability < 80:
+        best_name = "Conservative"
 
-    # Reorder point
-    rop = calc_reorder_point(adj_daily, lead_time_avg, ss)
+    # Override if lots of dead stock
+    if dead_stock > monthly_demand * 2:
+        best_name = "Lean"
 
-    # Enforce warehouse cap
-    eoq = min(eoq, warehouse_cap - ss) if warehouse_cap > 0 else eoq
+    results["recommended"] = best_name
+    results["daily_demand"] = round(daily_demand, 1)
+    results["annual_demand"] = round(annual_demand)
+    results["risk_score"] = round(
+        ((100 - reliability) * 0.4) +
+        ((1 if num_suppliers == 1 else 0) * 30) +
+        ((dead_stock / (monthly_demand + 1)) * 10), 1
+    )
 
-    # Budget check
-    budget_ok = (eoq * unit_cost) <= budget_limit if budget_limit > 0 else True
-
-    # Total cost
-    total_cost = calc_total_cost(adj_demand, eoq, order_cost, holding_cost_per_unit, ss)
-
-    # Dead stock working capital cost
-    wc_cost = 0
-    if apply_dead_stock and dead_stock_units > 0:
-        wc_cost = calc_working_capital_cost(dead_stock_units, unit_cost, holding_cost_pct)
-        total_cost += wc_cost
-
-    # Orders per year
-    orders_per_year = adj_demand / eoq if eoq > 0 else 0
-
-    # Stockout risk
-    stockout_risk = (100 - service_level)
-
-    return {
-        "eoq":             round(eoq),
-        "safety_stock":    round(ss),
-        "reorder_point":   round(rop),
-        "total_cost":      round(total_cost, 2),
-        "orders_per_year": round(orders_per_year, 1),
-        "holding_cost":    round(((eoq / 2) + ss) * holding_cost_per_unit, 2),
-        "order_cost_ann":  round((adj_demand / eoq) * order_cost if eoq > 0 else 0, 2),
-        "wc_cost":         round(wc_cost, 2),
-        "stockout_risk":   stockout_risk,
-        "budget_ok":       budget_ok,
-        "adj_demand":      round(adj_demand),
-        "obs_warning":     apply_obsolescence and (eoq >= calc_obsolescence_cap(shelf_life_days, adj_demand/working_days) * 0.95) if apply_obsolescence else False,
-    }
-
-# ════════════════════════════════════════════
-# AI RECOMMENDATION FUNCTION
-# ════════════════════════════════════════════
-
-def get_ai_recommendation(api_key, product_name, scenarios_data, constraints_summary):
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-
-        prompt = f"""
-You are a senior supply chain analyst. A user has run an Inventory Optimization Simulator for their product.
-
-PRODUCT: {product_name}
-
-BUSINESS CONSTRAINTS:
-{constraints_summary}
-
-SCENARIO RESULTS:
-{scenarios_data}
-
-Your task:
-1. Compare all scenarios across: total annual cost, safety stock levels, stockout risk, and feasibility given constraints.
-2. Clearly declare ONE winning scenario and explain WHY it is best for this specific business situation.
-3. Highlight the top 3 risks the user should be aware of based on their inputs.
-4. Give 3 specific, actionable recommendations the user should implement immediately.
-5. Flag any red flags in their current inventory setup.
-
-Write in clear, plain English. Be specific with numbers. Format your response with these exact headers:
-**RECOMMENDED SCENARIO**
-**WHY THIS SCENARIO WINS**
-**TOP 3 RISKS**
-**3 IMMEDIATE ACTIONS**
-**RED FLAGS**
-"""
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"AI Error: {str(e)}. Please check your API key."
+    return results
 
 # ════════════════════════════════════════════
-# VISUALIZATION FUNCTIONS
+# CHART FUNCTIONS
 # ════════════════════════════════════════════
+COLORS = {"Conservative": "#667eea", "Balanced": "#f093fb", "Lean": "#4facfe"}
 
-def plot_cost_comparison(results, scenario_names):
+def chart_cost_breakdown(sku_results, sku_name):
+    scenarios = ["Conservative", "Balanced", "Lean"]
     fig = go.Figure()
-    colors = ["#667eea", "#f093fb", "#4facfe", "#43e97b"]
-
-    for i, (name, r) in enumerate(zip(scenario_names, results)):
+    for s in scenarios:
+        r = sku_results[s]
         fig.add_trace(go.Bar(
-            name=name,
-            x=["Holding Cost", "Order Cost", "Working Capital Cost"],
+            name=s,
+            x=["Holding Cost", "Order Cost", "Dead Stock Cost"],
             y=[r["holding_cost"], r["order_cost_ann"], r["wc_cost"]],
-            marker_color=colors[i],
+            marker_color=COLORS[s],
             text=[f"${r['holding_cost']:,.0f}", f"${r['order_cost_ann']:,.0f}", f"${r['wc_cost']:,.0f}"],
             textposition="auto",
         ))
-
     fig.update_layout(
-        barmode="group", title="Cost Breakdown by Scenario",
-        yaxis_title="Annual Cost (USD)", xaxis_title="Cost Type",
-        plot_bgcolor="white", paper_bgcolor="white",
-        font=dict(family="Arial", size=12),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        height=400
+        barmode="group", title=f"Cost Breakdown — {sku_name}",
+        yaxis_title="USD/year", plot_bgcolor="white",
+        paper_bgcolor="white", height=360,
+        legend=dict(orientation="h", y=1.1)
     )
     return fig
 
-def plot_safety_stock_rop(results, scenario_names):
-    colors = ["#667eea", "#f093fb", "#4facfe", "#43e97b"]
+def chart_safety_rop(sku_results, sku_name):
+    scenarios = ["Conservative", "Balanced", "Lean"]
     fig = make_subplots(rows=1, cols=2,
                         subplot_titles=("Safety Stock (units)", "Reorder Point (units)"))
-
-    for i, (name, r) in enumerate(zip(scenario_names, results)):
+    for i, s in enumerate(scenarios):
+        r = sku_results[s]
         fig.add_trace(go.Bar(
-            name=name, x=[name], y=[r["safety_stock"]],
-            marker_color=colors[i], showlegend=False,
-            text=[f"{r['safety_stock']}"], textposition="auto"
+            name=s, x=[s], y=[r["safety_stock"]],
+            marker_color=COLORS[s], showlegend=False,
+            text=[f"{r['safety_stock']:,}"], textposition="auto"
         ), row=1, col=1)
         fig.add_trace(go.Bar(
-            name=name, x=[name], y=[r["reorder_point"]],
-            marker_color=colors[i], showlegend=False,
-            text=[f"{r['reorder_point']}"], textposition="auto"
+            name=s, x=[s], y=[r["reorder_point"]],
+            marker_color=COLORS[s], showlegend=False,
+            text=[f"{r['reorder_point']:,}"], textposition="auto"
         ), row=1, col=2)
-
     fig.update_layout(
         plot_bgcolor="white", paper_bgcolor="white",
-        height=380, title="Safety Stock & Reorder Point Comparison"
+        height=340, title=f"Safety Stock & Reorder Point — {sku_name}"
     )
     return fig
 
-def plot_total_cost_risk(results, scenario_names):
-    colors = ["#667eea", "#f093fb", "#4facfe", "#43e97b"]
-    fig = go.Figure()
-
-    for i, (name, r) in enumerate(zip(scenario_names, results)):
-        fig.add_trace(go.Scatter(
-            x=[r["stockout_risk"]], y=[r["total_cost"]],
-            mode="markers+text",
-            marker=dict(size=20, color=colors[i]),
-            text=[name], textposition="top center",
-            name=name
-        ))
-
-    fig.update_layout(
-        title="Cost vs Stockout Risk Tradeoff",
-        xaxis_title="Stockout Risk (%)",
-        yaxis_title="Total Annual Cost (USD)",
-        plot_bgcolor="white", paper_bgcolor="white",
-        height=400,
-        xaxis=dict(autorange="reversed")
-    )
-    return fig
-
-def plot_eoq_comparison(results, scenario_names):
-    colors = ["#667eea", "#f093fb", "#4facfe", "#43e97b"]
+def chart_total_cost(sku_results, sku_name):
+    scenarios = ["Conservative", "Balanced", "Lean"]
     fig = go.Figure(go.Bar(
-        x=scenario_names,
-        y=[r["eoq"] for r in results],
-        marker_color=colors[:len(results)],
-        text=[f"{r['eoq']} units" for r in results],
+        x=scenarios,
+        y=[sku_results[s]["total_cost"] for s in scenarios],
+        marker_color=[COLORS[s] for s in scenarios],
+        text=[f"${sku_results[s]['total_cost']:,.0f}" for s in scenarios],
         textposition="auto"
     ))
     fig.update_layout(
-        title="Economic Order Quantity (EOQ) per Scenario",
-        yaxis_title="Order Quantity (units)",
-        plot_bgcolor="white", paper_bgcolor="white",
-        height=360
+        title=f"Total Annual Cost — {sku_name}",
+        yaxis_title="USD/year",
+        plot_bgcolor="white", paper_bgcolor="white", height=340
+    )
+    return fig
+
+def chart_risk_vs_cost(sku_results, sku_name):
+    scenarios = ["Conservative", "Balanced", "Lean"]
+    fig = go.Figure()
+    for s in scenarios:
+        r = sku_results[s]
+        fig.add_trace(go.Scatter(
+            x=[r["stockout_risk"]], y=[r["total_cost"]],
+            mode="markers+text",
+            marker=dict(size=18, color=COLORS[s]),
+            text=[s], textposition="top center", name=s
+        ))
+    fig.update_layout(
+        title=f"Cost vs Stockout Risk — {sku_name}",
+        xaxis_title="Stockout Risk (%)",
+        yaxis_title="Total Annual Cost (USD)",
+        xaxis=dict(autorange="reversed"),
+        plot_bgcolor="white", paper_bgcolor="white", height=340
     )
     return fig
 
 # ════════════════════════════════════════════
-# MAIN APP UI
+# AI FUNCTION — GROQ
 # ════════════════════════════════════════════
+def get_ai_analysis(all_results, df):
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
 
-st.markdown('<p class="main-title">📦 Inventory Optimization Simulator</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-title">Enter your product data, define scenarios, and let AI recommend the best inventory strategy.</p>', unsafe_allow_html=True)
+        # Build a compact summary of top risk SKUs
+        risk_summary = ""
+        top_risk = sorted(all_results.items(),
+                         key=lambda x: x[1]["risk_score"], reverse=True)[:10]
 
-# ── SIDEBAR — API Key
-with st.sidebar:
-    st.markdown("### ⚙️ Settings")
-    api_key = st.text_input("Gemini API Key", type="password",
-                            placeholder="AIzaSy...",
-                            help="Get your free key at aistudio.google.com")
-    st.markdown("---")
-    st.markdown("### 📖 How to use")
-    st.markdown("""
-1. Enter your product details
-2. Set business constraints
-3. Choose scenarios to compare
-4. Click **Run Simulation**
-5. Get AI recommendation
-""")
+        for sku_id, r in top_risk:
+            row  = df[df["SKU_ID"] == sku_id].iloc[0]
+            name = row["Product_Name"]
+            rec  = r["recommended"]
+            risk_summary += f"""
+SKU: {sku_id} — {name}
+  Risk Score: {r['risk_score']}
+  Recommended Scenario: {rec}
+  EOQ: {r[rec]['eoq']} units | Safety Stock: {r[rec]['safety_stock']} units
+  Reorder Point: {r[rec]['reorder_point']} units
+  Total Annual Cost: ${r[rec]['total_cost']:,.0f}
+  Suppliers: {row['Num_Suppliers']} | Reliability: {row['Supplier_Reliability_Pct']}%
+"""
 
-# ════════════════════════════════════════
-# TAB LAYOUT
-# ════════════════════════════════════════
-tab1, tab2, tab3 = st.tabs(["📋 Product & Constraints", "🎯 Scenarios", "📊 Results & AI"])
+        total_skus    = len(all_results)
+        total_cost    = sum(r[r["recommended"]]["total_cost"] for r in all_results.values())
+        high_risk_cnt = sum(1 for r in all_results.values() if r["risk_score"] > 40)
+        single_src    = sum(1 for _, row in df.iterrows() if int(row["Num_Suppliers"]) == 1)
 
-# ════════════════════════════════════════
-# TAB 1 — PRODUCT & CONSTRAINTS
-# ════════════════════════════════════════
-with tab1:
-    st.markdown('<p class="section-header">Basic Product Information</p>', unsafe_allow_html=True)
-    col1, col2, col3 = st.columns(3)
+        prompt = f"""
+You are a senior pharmaceutical supply chain analyst.
+You have just run an inventory optimization analysis across {total_skus} SKUs.
 
-    with col1:
-        product_name     = st.text_input("Product Name", value="Product A")
-        annual_demand    = st.number_input("Annual Demand (units)", min_value=100, value=10000, step=100)
-        demand_std       = st.number_input("Demand Std Dev (units/day)", min_value=0.0, value=15.0, step=1.0,
-                                           help="How much daily demand varies. Higher = more unpredictable.")
-    with col2:
-        unit_cost        = st.number_input("Unit Cost (USD)", min_value=0.1, value=25.0, step=0.5)
-        order_cost       = st.number_input("Order Cost per Order (USD)", min_value=1.0, value=150.0, step=10.0,
-                                           help="Cost of placing one order — admin, shipping, processing.")
-        holding_cost_pct = st.number_input("Annual Holding Cost (%)", min_value=1.0, max_value=50.0, value=20.0, step=1.0,
-                                           help="Usually 20–30% of unit cost. Covers storage, insurance, capital.")
-    with col3:
-        working_days     = st.number_input("Working Days per Year", min_value=200, max_value=365, value=250)
-        moq              = st.number_input("Min Order Quantity (MOQ)", min_value=0, value=50, step=10,
-                                           help="Minimum units your supplier will ship per order.")
-        warehouse_cap    = st.number_input("Warehouse Capacity (units, 0 = no limit)", min_value=0, value=0, step=100)
-        budget_limit     = st.number_input("Budget per Order (USD, 0 = no limit)", min_value=0.0, value=0.0, step=100.0)
+PORTFOLIO SUMMARY:
+- Total SKUs analysed: {total_skus}
+- Total annual inventory cost (recommended scenarios): ${total_cost:,.0f}
+- High risk SKUs (risk score > 40): {high_risk_cnt}
+- Single-source supplier SKUs: {single_src}
 
-    st.markdown('<p class="section-header">Supply & Lead Time</p>', unsafe_allow_html=True)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        lead_time_avg    = st.number_input("Avg Lead Time (days)", min_value=1, value=14, step=1)
-        lead_time_std    = st.number_input("Lead Time Std Dev (days)", min_value=0.0, value=3.0, step=0.5,
-                                           help="How much lead time varies. High value = unreliable supplier.")
-    with col2:
-        num_suppliers    = st.selectbox("Number of Suppliers", [1, 2, 3, 4, 5], index=0)
-        reliability_pct  = st.slider("Supplier Reliability (%)", min_value=50, max_value=100, value=85,
-                                     help="% of orders delivered on time.")
-    with col3:
-        backup_supplier  = st.radio("Backup Supplier Available?", ["No", "Yes"], horizontal=True)
+TOP 10 HIGHEST RISK SKUs:
+{risk_summary}
 
-    st.markdown('<p class="section-header">Business Constraints</p>', unsafe_allow_html=True)
+Provide a concise but insightful portfolio-level analysis with these exact sections:
 
-    col1, col2 = st.columns(2)
+**PORTFOLIO HEALTH SUMMARY**
+2-3 sentences on the overall state of this pharma company's inventory.
 
-    with col1:
-        st.markdown("**🌡️ Seasonal Demand**")
-        apply_seasonal   = st.checkbox("Apply seasonal demand adjustment", value=False)
-        if apply_seasonal:
-            is_peak      = st.radio("Current season:", ["Peak Season", "Off-Peak Season"], horizontal=True)
-            peak_mult    = st.slider("Peak demand multiplier", 1.0, 3.0, 1.8, 0.1,
-                                     help="e.g. 1.8 means demand is 80% higher in peak season")
-            offpeak_mult = st.slider("Off-peak demand multiplier", 0.3, 1.0, 0.7, 0.1)
-        else:
-            is_peak      = False
-            peak_mult    = 1.0
-            offpeak_mult = 1.0
+**TOP 5 CRITICAL SKUs NEEDING IMMEDIATE ATTENTION**
+List the 5 highest risk SKUs with one specific action for each.
 
-        st.markdown("**💰 Raw Material Price Volatility**")
-        apply_price      = st.checkbox("Apply price volatility adjustment", value=False)
-        if apply_price:
-            price_trend  = st.selectbox("Price trend next 3 months", ["Rising", "Stable", "Falling"])
-            price_chg    = st.slider("Expected price change (%)", 0, 50, 10)
-        else:
-            price_trend  = "Stable"
-            price_chg    = 0
+**3 BIGGEST SUPPLY CHAIN RISKS**
+Based on the data — what are the top 3 systemic risks in this portfolio?
 
-    with col2:
-        st.markdown("**⏰ Obsolescence Risk**")
-        apply_obs        = st.checkbox("Apply obsolescence / shelf life cap", value=False)
-        if apply_obs:
-            shelf_life   = st.number_input("Product shelf life (days)", min_value=30, value=180, step=30)
-            obs_risk     = st.selectbox("Obsolescence risk level", ["Low", "Medium", "High"])
-        else:
-            shelf_life   = 9999
-            obs_risk     = "Low"
+**5 IMMEDIATE ACTIONS**
+Specific, numbered, actionable steps this company should take this month.
 
-        st.markdown("**🏚️ Dead Stock**")
-        apply_dead       = st.checkbox("Account for existing dead stock", value=False)
-        if apply_dead:
-            dead_units   = st.number_input("Dead stock units on hand", min_value=0, value=500, step=50)
-            dead_months  = st.number_input("Months since last movement", min_value=1, value=6)
-        else:
-            dead_units   = 0
-            dead_months  = 0
+**COST OPTIMISATION OPPORTUNITIES**
+Where can they reduce inventory costs without increasing risk?
 
-# Store in session state for use in other tabs
-st.session_state["inputs"] = dict(
-    product_name=product_name, annual_demand=annual_demand, demand_std=demand_std,
-    unit_cost=unit_cost, order_cost=order_cost, holding_cost_pct=holding_cost_pct,
-    working_days=working_days, moq=moq, warehouse_cap=warehouse_cap,
-    budget_limit=budget_limit, lead_time_avg=lead_time_avg, lead_time_std=lead_time_std,
-    num_suppliers=num_suppliers, reliability_pct=reliability_pct, backup_supplier=backup_supplier,
-    apply_seasonal=apply_seasonal, is_peak=(is_peak=="Peak Season"),
-    peak_mult=peak_mult, offpeak_mult=offpeak_mult,
-    apply_price=apply_price, price_trend=price_trend, price_chg=price_chg,
-    apply_obs=apply_obs, shelf_life=shelf_life, obs_risk=obs_risk,
-    apply_dead=apply_dead, dead_units=dead_units,
-)
+Be specific with numbers. Write for a supply chain director who will act on this today.
+"""
 
-# ════════════════════════════════════════
-# TAB 2 — SCENARIOS
-# ════════════════════════════════════════
-with tab2:
-    st.markdown('<p class="section-header">Define Your Scenarios</p>', unsafe_allow_html=True)
-    st.markdown("Each scenario uses a different **service level** — the probability of never running out of stock. Higher service level = more safety stock = higher cost but lower risk.")
+        response = client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1500
+        )
+        return response.choices[0].message.content
 
-    col1, col2, col3, col4 = st.columns(4)
+    except Exception as e:
+        return f"AI Error: {str(e)}"
 
-    with col1:
-        st.markdown("#### 🛡️ Scenario A — Conservative")
-        use_a  = st.checkbox("Include Scenario A", value=True)
-        sl_a   = st.selectbox("Service Level A", [90, 95, 97, 99], index=3, key="sla")
-        name_a = st.text_input("Name", value="Conservative", key="na")
+# ════════════════════════════════════════════
+# EXCEL REPORT GENERATOR
+# ════════════════════════════════════════════
+def generate_excel_report(all_results, df):
+    wb = openpyxl.Workbook()
 
-    with col2:
-        st.markdown("#### ⚖️ Scenario B — Balanced")
-        use_b  = st.checkbox("Include Scenario B", value=True)
-        sl_b   = st.selectbox("Service Level B", [90, 95, 97, 99], index=1, key="slb")
-        name_b = st.text_input("Name", value="Balanced", key="nb")
+    # ── Styles
+    header_fill   = PatternFill("solid", fgColor="667EEA")
+    header_font   = Font(bold=True, color="FFFFFF", size=11)
+    risk_high_fill = PatternFill("solid", fgColor="FFE0E0")
+    risk_med_fill  = PatternFill("solid", fgColor="FFF8E0")
+    risk_low_fill  = PatternFill("solid", fgColor="E8FFE8")
+    center        = Alignment(horizontal="center", vertical="center")
+    bold          = Font(bold=True)
 
-    with col3:
-        st.markdown("#### 🏃 Scenario C — Lean")
-        use_c  = st.checkbox("Include Scenario C", value=True)
-        sl_c   = st.selectbox("Service Level C", [90, 95, 97, 99], index=0, key="slc")
-        name_c = st.text_input("Name", value="Lean", key="nc")
+    def style_header_row(ws, row_num, num_cols):
+        for c in range(1, num_cols + 1):
+            cell            = ws.cell(row=row_num, column=c)
+            cell.fill       = header_fill
+            cell.font       = header_font
+            cell.alignment  = center
 
-    with col4:
-        st.markdown("#### ✏️ Scenario D — Custom")
-        use_d  = st.checkbox("Include Scenario D", value=False)
-        sl_d   = st.selectbox("Service Level D", [90, 95, 97, 99], index=1, key="sld")
-        name_d = st.text_input("Name", value="Custom", key="nd")
+    def auto_width(ws):
+        for col in ws.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                try:
+                    if cell.value:
+                        max_len = max(max_len, len(str(cell.value)))
+                except:
+                    pass
+            ws.column_dimensions[col_letter].width = min(max_len + 4, 30)
 
-    st.session_state["scenarios"] = [
-        (use_a, sl_a, name_a), (use_b, sl_b, name_b),
-        (use_c, sl_c, name_c), (use_d, sl_d, name_d)
+    # ════ SHEET 1 — Summary Dashboard ════
+    ws1 = wb.active
+    ws1.title = "Summary Dashboard"
+    headers = ["SKU ID", "Product Name", "Risk Score", "Recommended",
+               "EOQ (units)", "Safety Stock", "Reorder Point",
+               "Total Cost/Year", "Orders/Year", "Stockout Risk %"]
+    ws1.append(headers)
+    style_header_row(ws1, 1, len(headers))
+
+    for sku_id, r in all_results.items():
+        row  = df[df["SKU_ID"] == sku_id].iloc[0]
+        rec  = r["recommended"]
+        data = [
+            sku_id, row["Product_Name"], r["risk_score"], rec,
+            r[rec]["eoq"], r[rec]["safety_stock"], r[rec]["reorder_point"],
+            f"${r[rec]['total_cost']:,.0f}", r[rec]["orders_per_year"],
+            f"{r[rec]['stockout_risk']}%"
+        ]
+        ws1.append(data)
+        row_idx = ws1.max_row
+        fill = risk_high_fill if r["risk_score"] > 40 else (
+               risk_med_fill  if r["risk_score"] > 20 else risk_low_fill)
+        for c in range(1, len(headers) + 1):
+            ws1.cell(row=row_idx, column=c).fill = fill
+
+    auto_width(ws1)
+
+    # ════ SHEET 2 — High Risk SKUs ════
+    ws2 = wb.create_sheet("High Risk SKUs")
+    ws2.append(["SKU ID", "Product Name", "Risk Score", "Risk Reason",
+                "Suppliers", "Reliability %", "Recommended Action"])
+    style_header_row(ws2, 1, 7)
+
+    high_risk = [(k, v) for k, v in all_results.items() if v["risk_score"] > 40]
+    high_risk.sort(key=lambda x: x[1]["risk_score"], reverse=True)
+
+    for sku_id, r in high_risk:
+        row = df[df["SKU_ID"] == sku_id].iloc[0]
+        reasons = []
+        if int(row["Num_Suppliers"]) == 1:
+            reasons.append("Single source supplier")
+        if float(row["Supplier_Reliability_Pct"]) < 80:
+            reasons.append("Low supplier reliability")
+        if float(row.get("Dead_Stock_Units", 0) or 0) > float(row["Monthly_Demand"]):
+            reasons.append("High dead stock")
+
+        ws2.append([
+            sku_id, row["Product_Name"], r["risk_score"],
+            " | ".join(reasons) if reasons else "Multiple factors",
+            row["Num_Suppliers"], row["Supplier_Reliability_Pct"],
+            f"Increase safety stock to {r['Conservative']['safety_stock']} units"
+        ])
+        for c in range(1, 8):
+            ws2.cell(row=ws2.max_row, column=c).fill = risk_high_fill
+
+    auto_width(ws2)
+
+    # ════ SHEET 3 — Full Cost Analysis ════
+    ws3 = wb.create_sheet("Cost Analysis")
+    ws3.append(["SKU ID", "Product Name", "Scenario",
+                "Holding Cost", "Order Cost", "Dead Stock Cost", "Total Cost"])
+    style_header_row(ws3, 1, 7)
+
+    for sku_id, r in all_results.items():
+        row = df[df["SKU_ID"] == sku_id].iloc[0]
+        for scenario in ["Conservative", "Balanced", "Lean"]:
+            s = r[scenario]
+            ws3.append([
+                sku_id, row["Product_Name"], scenario,
+                f"${s['holding_cost']:,.0f}",
+                f"${s['order_cost_ann']:,.0f}",
+                f"${s['wc_cost']:,.0f}",
+                f"${s['total_cost']:,.0f}"
+            ])
+
+    auto_width(ws3)
+
+    # ════ SHEET 4 — Reorder Schedule ════
+    ws4 = wb.create_sheet("Reorder Schedule")
+    ws4.append(["SKU ID", "Product Name", "Daily Demand",
+                "Reorder Point", "EOQ", "Orders Per Year",
+                "Lead Time (days)", "Safety Stock"])
+    style_header_row(ws4, 1, 8)
+
+    for sku_id, r in all_results.items():
+        row = df[df["SKU_ID"] == sku_id].iloc[0]
+        rec = r["recommended"]
+        ws4.append([
+            sku_id, row["Product_Name"], r["daily_demand"],
+            r[rec]["reorder_point"], r[rec]["eoq"],
+            r[rec]["orders_per_year"], row["Lead_Time_Days"],
+            r[rec]["safety_stock"]
+        ])
+
+    auto_width(ws4)
+
+    # ════ SHEET 5 — Scenario Comparison ════
+    ws5 = wb.create_sheet("Scenario Comparison")
+    ws5.append(["SKU ID", "Product Name",
+                "Conservative EOQ", "Conservative SS", "Conservative Cost",
+                "Balanced EOQ",     "Balanced SS",     "Balanced Cost",
+                "Lean EOQ",         "Lean SS",          "Lean Cost",
+                "Recommended"])
+    style_header_row(ws5, 1, 12)
+
+    for sku_id, r in all_results.items():
+        row = df[df["SKU_ID"] == sku_id].iloc[0]
+        ws5.append([
+            sku_id, row["Product_Name"],
+            r["Conservative"]["eoq"], r["Conservative"]["safety_stock"], f"${r['Conservative']['total_cost']:,.0f}",
+            r["Balanced"]["eoq"],     r["Balanced"]["safety_stock"],     f"${r['Balanced']['total_cost']:,.0f}",
+            r["Lean"]["eoq"],         r["Lean"]["safety_stock"],          f"${r['Lean']['total_cost']:,.0f}",
+            r["recommended"]
+        ])
+
+    auto_width(ws5)
+
+    # ── Save to bytes
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+# ════════════════════════════════════════════
+# EXCEL TEMPLATE GENERATOR
+# ════════════════════════════════════════════
+def generate_template():
+    wb   = openpyxl.Workbook()
+    ws   = wb.active
+    ws.title = "Inventory Data"
+
+    req_fill  = PatternFill("solid", fgColor="E8F4FD")
+    opt_fill  = PatternFill("solid", fgColor="FFF8E1")
+    req_font  = Font(bold=True, color="0D47A1")
+    opt_font  = Font(bold=True, color="E65100")
+    center    = Alignment(horizontal="center")
+
+    required_cols = [
+        "SKU_ID", "Product_Name", "Monthly_Demand",
+        "Unit_Cost_USD", "Order_Cost_USD", "Lead_Time_Days",
+        "Num_Suppliers", "Supplier_Reliability_Pct", "Service_Level_Pct"
+    ]
+    optional_cols = [
+        "Working_Days_Month", "Monthly_Holding_Cost_Pct",
+        "Demand_Std_Dev", "Lead_Time_Std_Dev", "MOQ",
+        "Shelf_Life_Days", "Dead_Stock_Units", "Price_Trend",
+        "Peak_Season_Multiplier"
     ]
 
-# ════════════════════════════════════════
-# TAB 3 — RESULTS & AI
-# ════════════════════════════════════════
-with tab3:
-    if st.button("🚀 Run Simulation & Get AI Recommendation"):
-        inp = st.session_state.get("inputs", {})
-        scenarios = st.session_state.get("scenarios", [])
+    all_cols = required_cols + optional_cols
+    ws.append(all_cols)
 
-        if not inp:
-            st.error("Please fill in your product details in Tab 1 first.")
+    for i, col in enumerate(all_cols, 1):
+        cell = ws.cell(row=1, column=i)
+        if col in required_cols:
+            cell.fill      = req_fill
+            cell.font      = req_font
         else:
-            active = [(sl, name) for (use, sl, name) in scenarios if use]
-            if len(active) < 2:
-                st.warning("Please enable at least 2 scenarios in Tab 2 to compare.")
+            cell.fill      = opt_fill
+            cell.font      = opt_font
+        cell.alignment = center
+
+    # ── Sample rows
+    samples = [
+        ["PAR-500", "Paracetamol 500mg", 4200, 5.00, 200, 14, 1, 78, 95,
+         22, 2.0, 15, 3, 100, 1095, 200, "Stable", 1.0],
+        ["AMO-250", "Amoxicillin 250mg", 3100, 8.50, 180, 21, 2, 88, 95,
+         22, 2.0, "", "", 50, 730, 0, "Rising", 1.3],
+        ["INS-100", "Insulin 100IU",      890, 45.00, 350, 30, 1, 72, 99,
+         22, 2.5, 5, 5, 20, 180, 50, "Stable", 1.0],
+        ["MET-500", "Metformin 500mg",   5600, 3.20, 150, 18, 3, 92, 90,
+         22, 1.8, 20, 4, 200, 1825, 0, "Falling", 1.0],
+        ["CIP-500", "Ciprofloxacin 500mg",2400, 12.00, 220, 25, 1, 65, 99,
+         22, 2.0, 10, 6, 50, 730, 300, "Rising", 1.5],
+    ]
+    for s in samples:
+        ws.append(s)
+
+    # ── Instructions sheet
+    ws2         = wb.create_sheet("Instructions")
+    ws2["A1"]   = "HOW TO FILL THE TEMPLATE"
+    ws2["A1"].font = Font(bold=True, size=14)
+    instructions = [
+        ("", ""),
+        ("BLUE columns", "REQUIRED — must be filled for every product"),
+        ("ORANGE columns", "OPTIONAL — leave blank if unknown, app will use smart defaults"),
+        ("", ""),
+        ("SKU_ID", "Unique code for your product e.g. PAR-500"),
+        ("Product_Name", "Full product name"),
+        ("Monthly_Demand", "How many units you sell per month"),
+        ("Unit_Cost_USD", "Cost per unit in USD"),
+        ("Order_Cost_USD", "Cost to place one order (admin + shipping)"),
+        ("Lead_Time_Days", "Average days your supplier takes to deliver"),
+        ("Num_Suppliers", "Number of suppliers for this product (1, 2, 3...)"),
+        ("Supplier_Reliability_Pct", "% of orders delivered on time (0-100)"),
+        ("Service_Level_Pct", "Target service level: 90, 95, 97, or 99"),
+        ("", ""),
+        ("Working_Days_Month", "Working days per month (default: 22)"),
+        ("Monthly_Holding_Cost_Pct", "Monthly storage cost as % of unit cost (default: 2%)"),
+        ("Demand_Std_Dev", "Daily demand standard deviation (default: 20% of daily demand)"),
+        ("Lead_Time_Std_Dev", "Lead time standard deviation in days (default: 20% of lead time)"),
+        ("MOQ", "Minimum order quantity from supplier (default: none)"),
+        ("Shelf_Life_Days", "Product shelf life in days (default: no limit)"),
+        ("Dead_Stock_Units", "Units currently sitting idle (default: 0)"),
+        ("Price_Trend", "Rising / Stable / Falling (default: Stable)"),
+        ("Peak_Season_Multiplier", "Demand multiplier in peak season e.g. 1.8 (default: 1.0)"),
+        ("", ""),
+        ("MAX SKUs", "Up to 500 products per upload"),
+        ("FILE FORMAT", "Save as .xlsx before uploading"),
+    ]
+    for row in instructions:
+        ws2.append(list(row))
+
+    ws2.column_dimensions["A"].width = 28
+    ws2.column_dimensions["B"].width = 55
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+# ════════════════════════════════════════════
+# MAIN APP
+# ════════════════════════════════════════════
+st.markdown('<p class="main-title">💊 Pharma Inventory Optimizer</p>', unsafe_allow_html=True)
+st.markdown('<p class="sub-title">Upload your product data and get instant inventory optimization across all SKUs — EOQ, safety stock, reorder points, and AI recommendations.</p>', unsafe_allow_html=True)
+
+tab1, tab2, tab3 = st.tabs(["📂 Upload", "📊 Results", "🤖 AI & Export"])
+
+# ════════════════════════════════════════════
+# TAB 1 — UPLOAD
+# ════════════════════════════════════════════
+with tab1:
+    st.markdown('<p class="section-header">Step 1 — Download the Template</p>', unsafe_allow_html=True)
+    st.markdown("Download the Excel template, fill in your product data, then upload it back. Only 9 columns are required — the rest are optional.")
+
+    template_file = generate_template()
+    st.download_button(
+        label="⬇️ Download Excel Template",
+        data=template_file,
+        file_name="pharma_inventory_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    st.markdown("**Template has 2 sheets:**")
+    st.markdown("- **Inventory Data** — fill your products here (blue = required, orange = optional)")
+    st.markdown("- **Instructions** — explains every column")
+
+    st.markdown('<p class="section-header">Step 2 — Upload Your Filled Template</p>', unsafe_allow_html=True)
+
+    uploaded = st.file_uploader(
+        "Upload your filled Excel file",
+        type=["xlsx"],
+        help="Max 500 SKUs. Make sure all required columns are filled."
+    )
+
+    if uploaded:
+        try:
+            df = pd.read_excel(uploaded, sheet_name="Inventory Data")
+
+            required_cols = [
+                "SKU_ID", "Product_Name", "Monthly_Demand",
+                "Unit_Cost_USD", "Order_Cost_USD", "Lead_Time_Days",
+                "Num_Suppliers", "Supplier_Reliability_Pct", "Service_Level_Pct"
+            ]
+
+            missing = [c for c in required_cols if c not in df.columns]
+
+            if missing:
+                st.error(f"❌ Missing required columns: {', '.join(missing)}")
             else:
-                results      = []
-                scenario_names = []
+                df = df.dropna(subset=required_cols)
 
-                with st.spinner("Calculating scenarios..."):
-                    for sl, name in active:
-                        r = run_scenario(
-                            service_level    = sl,
-                            annual_demand    = inp["annual_demand"],
-                            order_cost       = inp["order_cost"],
-                            unit_cost        = inp["unit_cost"],
-                            holding_cost_pct = inp["holding_cost_pct"],
-                            lead_time_avg    = inp["lead_time_avg"],
-                            lead_time_std    = inp["lead_time_std"],
-                            demand_std       = inp["demand_std"],
-                            working_days     = inp["working_days"],
-                            num_suppliers    = inp["num_suppliers"],
-                            reliability_pct  = inp["reliability_pct"],
-                            price_trend      = inp["price_trend"],
-                            price_change_pct = inp["price_chg"],
-                            shelf_life_days  = inp["shelf_life"],
-                            apply_obsolescence = inp["apply_obs"],
-                            dead_stock_units = inp["dead_units"],
-                            apply_dead_stock = inp["apply_dead"],
-                            is_peak_season   = inp["is_peak"],
-                            peak_multiplier  = inp["peak_mult"],
-                            offpeak_multiplier = inp["offpeak_mult"],
-                            moq              = inp["moq"],
-                            warehouse_cap    = inp["warehouse_cap"] if inp["warehouse_cap"] > 0 else 999999,
-                            budget_limit     = inp["budget_limit"] if inp["budget_limit"] > 0 else 999999999,
-                        )
-                        results.append(r)
-                        scenario_names.append(name)
-
-                # ── Results metrics
-                st.markdown('<p class="section-header">📊 Scenario Results</p>', unsafe_allow_html=True)
-                cols = st.columns(len(results))
-                for i, (col, name, r) in enumerate(zip(cols, scenario_names, results)):
-                    with col:
-                        st.markdown(f"**{name} (SL: {active[i][0]}%)**")
-                        st.markdown(f"""
-<div class="metric-card">
-  <div class="metric-label">EOQ</div>
-  <div class="metric-value">{r['eoq']:,}</div>
-  <div class="metric-unit">units per order</div>
-</div>
-<div class="metric-card">
-  <div class="metric-label">Safety Stock</div>
-  <div class="metric-value">{r['safety_stock']:,}</div>
-  <div class="metric-unit">units</div>
-</div>
-<div class="metric-card">
-  <div class="metric-label">Reorder Point</div>
-  <div class="metric-value">{r['reorder_point']:,}</div>
-  <div class="metric-unit">units</div>
-</div>
-<div class="metric-card">
-  <div class="metric-label">Total Annual Cost</div>
-  <div class="metric-value">${r['total_cost']:,.0f}</div>
-  <div class="metric-unit">USD/year</div>
-</div>
-<div class="metric-card">
-  <div class="metric-label">Orders Per Year</div>
-  <div class="metric-value">{r['orders_per_year']}</div>
-  <div class="metric-unit">orders</div>
-</div>
-""", unsafe_allow_html=True)
-                        if not r["budget_ok"]:
-                            st.markdown('<div class="warning-box">⚠️ Exceeds budget limit</div>', unsafe_allow_html=True)
-                        if r["obs_warning"]:
-                            st.markdown('<div class="warning-box">⚠️ EOQ near shelf life cap</div>', unsafe_allow_html=True)
-
-                # ── Charts
-                st.markdown('<p class="section-header">📈 Visual Comparison</p>', unsafe_allow_html=True)
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.plotly_chart(plot_cost_comparison(results, scenario_names), use_container_width=True)
-                with c2:
-                    st.plotly_chart(plot_safety_stock_rop(results, scenario_names), use_container_width=True)
-                c3, c4 = st.columns(2)
-                with c3:
-                    st.plotly_chart(plot_total_cost_risk(results, scenario_names), use_container_width=True)
-                with c4:
-                    st.plotly_chart(plot_eoq_comparison(results, scenario_names), use_container_width=True)
-
-                # ── AI Recommendation
-                st.markdown('<p class="section-header">🤖 AI Recommendation</p>', unsafe_allow_html=True)
-
-                if not api_key:
-                    st.markdown('<div class="info-box">ℹ️ Enter your Gemini API key in the sidebar to get AI recommendations.</div>', unsafe_allow_html=True)
+                if len(df) == 0:
+                    st.error("❌ No valid rows found. Please check your required columns.")
+                elif len(df) > 500:
+                    st.warning(f"⚠️ {len(df)} SKUs found. Trimming to first 500.")
+                    df = df.head(500)
                 else:
-                    with st.spinner("AI is analysing your scenarios..."):
-                        scenarios_text = ""
-                        for name, r in zip(scenario_names, results):
-                            scenarios_text += f"""
-Scenario: {name}
-  - EOQ: {r['eoq']} units
-  - Safety Stock: {r['safety_stock']} units
-  - Reorder Point: {r['reorder_point']} units
-  - Total Annual Cost: ${r['total_cost']:,.2f}
-  - Orders Per Year: {r['orders_per_year']}
-  - Holding Cost: ${r['holding_cost']:,.2f}
-  - Order Cost: ${r['order_cost_ann']:,.2f}
-  - Stockout Risk: {r['stockout_risk']}%
-  - Budget OK: {r['budget_ok']}
-"""
-                        constraints_text = f"""
-- Suppliers: {inp['num_suppliers']} (Reliability: {inp['reliability_pct']}%)
-- Backup supplier: {inp['backup_supplier']}
-- Lead time: {inp['lead_time_avg']} days avg (±{inp['lead_time_std']} days)
-- Seasonal adjustment: {'Yes — ' + ('Peak' if inp['is_peak'] else 'Off-peak') if inp['apply_seasonal'] else 'No'}
-- Price trend: {inp['price_trend']} ({inp['price_chg']}% change expected)
-- Obsolescence risk: {inp['obs_risk'] if inp['apply_obs'] else 'Not applied'}
-- Dead stock: {inp['dead_units'] if inp['apply_dead'] else 'Not applied'} units ({inp['dead_months'] if inp['apply_dead'] else 'N/A'} months idle)
-- Warehouse capacity: {inp['warehouse_cap'] if inp['warehouse_cap'] > 0 else 'No limit'}
-- Budget per order: ${inp['budget_limit'] if inp['budget_limit'] > 0 else 'No limit'}
-"""
-                        ai_output = get_ai_recommendation(
-                            api_key, inp["product_name"], scenarios_text, constraints_text)
-                        st.markdown(ai_output)
+                    st.success(f"✅ {len(df)} SKUs validated successfully!")
+                    st.dataframe(df.head(10), use_container_width=True)
+                    if len(df) > 10:
+                        st.caption(f"Showing first 10 of {len(df)} rows.")
+                    st.session_state["df"] = df
+                    st.info("✅ Data ready! Go to the **Results** tab to see your analysis.")
 
-                # ── Download CSV
-                st.markdown('<p class="section-header">💾 Export Results</p>', unsafe_allow_html=True)
-                df_export = pd.DataFrame(results, index=scenario_names)
-                csv = df_export.to_csv().encode("utf-8")
-                st.download_button(
-                    label="⬇️ Download Results as CSV",
-                    data=csv,
-                    file_name=f"{inp['product_name']}_inventory_optimization.csv",
-                    mime="text/csv"
-                )
+        except Exception as e:
+            st.error(f"❌ Error reading file: {str(e)}")
+
+# ════════════════════════════════════════════
+# TAB 2 — RESULTS
+# ════════════════════════════════════════════
+with tab2:
+    if "df" not in st.session_state:
+        st.info("📂 Please upload your data in the Upload tab first.")
+    else:
+        df = st.session_state["df"]
+
+        # ── Run all calculations
+        if "all_results" not in st.session_state:
+            with st.spinner("Calculating all SKUs..."):
+                all_results = {}
+                for _, row in df.iterrows():
+                    try:
+                        all_results[str(row["SKU_ID"])] = run_sku(row)
+                    except Exception as e:
+                        st.warning(f"Skipped {row['SKU_ID']}: {e}")
+                st.session_state["all_results"] = all_results
+
+        all_results = st.session_state["all_results"]
+
+        # ── Portfolio summary cards
+        st.markdown('<p class="section-header">Portfolio Overview</p>', unsafe_allow_html=True)
+
+        total_cost    = sum(r[r["recommended"]]["total_cost"] for r in all_results.values())
+        total_ss      = sum(r[r["recommended"]]["safety_stock"] for r in all_results.values())
+        high_risk_cnt = sum(1 for r in all_results.values() if r["risk_score"] > 40)
+        single_src    = sum(1 for _, row in df.iterrows() if int(row["Num_Suppliers"]) == 1)
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.markdown(f"""<div class="metric-card">
+              <div class="metric-label">Total SKUs</div>
+              <div class="metric-value">{len(all_results)}</div>
+              <div class="metric-unit">products analysed</div>
+            </div>""", unsafe_allow_html=True)
+        with c2:
+            st.markdown(f"""<div class="metric-card">
+              <div class="metric-label">Total Annual Cost</div>
+              <div class="metric-value">${total_cost:,.0f}</div>
+              <div class="metric-unit">across all SKUs</div>
+            </div>""", unsafe_allow_html=True)
+        with c3:
+            st.markdown(f"""<div class="metric-card">
+              <div class="metric-label">High Risk SKUs</div>
+              <div class="metric-value" style="color:#cc0000">{high_risk_cnt}</div>
+              <div class="metric-unit">need immediate attention</div>
+            </div>""", unsafe_allow_html=True)
+        with c4:
+            st.markdown(f"""<div class="metric-card">
+              <div class="metric-label">Single Source SKUs</div>
+              <div class="metric-value" style="color:#996600">{single_src}</div>
+              <div class="metric-unit">supplier dependency risk</div>
+            </div>""", unsafe_allow_html=True)
+
+        # ── SKU navigator
+        st.markdown('<p class="section-header">SKU Deep Dive</p>', unsafe_allow_html=True)
+
+        sku_options = [f"{row['SKU_ID']} — {row['Product_Name']}"
+                       for _, row in df.iterrows()]
+        selected    = st.selectbox("Select a product to analyse:", sku_options)
+        sku_id      = selected.split(" — ")[0]
+        sku_name    = selected.split(" — ")[1]
+        r           = all_results[str(sku_id)]
+        rec         = r["recommended"]
+
+        # ── Recommended scenario banner
+        st.markdown(f'<div class="scenario-winner">⭐ Recommended Scenario: {rec} — Total Annual Cost: ${r[rec]["total_cost"]:,.0f}</div>',
+                    unsafe_allow_html=True)
+
+        # ── Risk indicator
+        rs = r["risk_score"]
+        if rs > 40:
+            st.markdown(f'<div class="risk-high">🔴 High Risk SKU (score: {rs}) — Immediate attention required</div>', unsafe_allow_html=True)
+        elif rs > 20:
+            st.markdown(f'<div class="risk-med">🟡 Medium Risk SKU (score: {rs}) — Monitor closely</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="risk-low">🟢 Low Risk SKU (score: {rs}) — Well managed</div>', unsafe_allow_html=True)
+
+        # ── Metrics for all 3 scenarios
+        cols = st.columns(3)
+        for col, scenario in zip(cols, ["Conservative", "Balanced", "Lean"]):
+            s = r[scenario]
+            star = " ⭐" if scenario == rec else ""
+            with col:
+                st.markdown(f"**{scenario} (SL: {s['service_level']}%){star}**")
+                st.markdown(f"""<div class="metric-card">
+                  <div class="metric-label">EOQ</div>
+                  <div class="metric-value">{s['eoq']:,}</div>
+                  <div class="metric-unit">units per order</div>
+                </div>
+                <div class="metric-card">
+                  <div class="metric-label">Safety Stock</div>
+                  <div class="metric-value">{s['safety_stock']:,}</div>
+                  <div class="metric-unit">units</div>
+                </div>
+                <div class="metric-card">
+                  <div class="metric-label">Reorder Point</div>
+                  <div class="metric-value">{s['reorder_point']:,}</div>
+                  <div class="metric-unit">units</div>
+                </div>
+                <div class="metric-card">
+                  <div class="metric-label">Total Annual Cost</div>
+                  <div class="metric-value">${s['total_cost']:,.0f}</div>
+                  <div class="metric-unit">USD/year</div>
+                </div>
+                <div class="metric-card">
+                  <div class="metric-label">Orders Per Year</div>
+                  <div class="metric-value">{s['orders_per_year']}</div>
+                  <div class="metric-unit">orders</div>
+                </div>""", unsafe_allow_html=True)
+
+        # ── Charts
+        st.markdown('<p class="section-header">Visual Analysis</p>', unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(chart_cost_breakdown(r, sku_name), use_container_width=True)
+        with c2:
+            st.plotly_chart(chart_safety_rop(r, sku_name), use_container_width=True)
+        c3, c4 = st.columns(2)
+        with c3:
+            st.plotly_chart(chart_total_cost(r, sku_name), use_container_width=True)
+        with c4:
+            st.plotly_chart(chart_risk_vs_cost(r, sku_name), use_container_width=True)
+
+# ════════════════════════════════════════════
+# TAB 3 — AI & EXPORT
+# ════════════════════════════════════════════
+with tab3:
+    if "all_results" not in st.session_state:
+        st.info("📂 Please upload your data in the Upload tab first.")
+    else:
+        all_results = st.session_state["all_results"]
+        df          = st.session_state["df"]
+
+        st.markdown('<p class="section-header">AI Portfolio Analysis</p>', unsafe_allow_html=True)
+        st.markdown("Click below to get an AI-powered analysis of your entire inventory portfolio — risks, opportunities, and immediate actions.")
+
+        if st.button("🤖 Generate AI Analysis"):
+            with st.spinner("AI is analysing your portfolio..."):
+                ai_output = get_ai_analysis(all_results, df)
+                st.session_state["ai_output"] = ai_output
+
+        if "ai_output" in st.session_state:
+            st.markdown(st.session_state["ai_output"])
+
+        st.markdown('<p class="section-header">Download Full Report</p>', unsafe_allow_html=True)
+        st.markdown("Download a complete Excel report with 5 organized sheets — summary dashboard, high risk SKUs, cost analysis, reorder schedule, and scenario comparison.")
+
+        report = generate_excel_report(all_results, df)
+        st.download_button(
+            label="⬇️ Download Full Excel Report",
+            data=report,
+            file_name="pharma_inventory_optimization_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
