@@ -2,5 +2,6 @@ streamlit
 pandas
 numpy
 plotly
-google-generativeai
-fpdf2
+groq
+openpyxl
+PyGithub
