@@ -603,6 +603,59 @@ def generate_template():
     output.seek(0)
     return output
 
+
+# ════════════════════════════════════════════
+# CHAT FUNCTION
+# ════════════════════════════════════════════
+def get_chat_response(client, question, conversation_history, all_results, df):
+    try:
+        # Build compact data context
+        top_risk = sorted(all_results.items(),
+                         key=lambda x: x[1]["risk_score"], reverse=True)[:5]
+        context = "INVENTORY PORTFOLIO CONTEXT:\n"
+        context += f"Total SKUs: {len(all_results)}\n"
+        context += f"High risk SKUs: {sum(1 for r in all_results.values() if r['risk_score'] > 40)}\n\n"
+        context += "TOP 5 HIGH RISK SKUs:\n"
+        for sku_id, r in top_risk:
+            row  = df[df["SKU_ID"] == sku_id].iloc[0]
+            rec  = r["recommended"]
+            context += f"- {sku_id} ({row['Product_Name']}): Risk={r['risk_score']}, EOQ={r[rec]['eoq']}, Safety Stock={r[rec]['safety_stock']}, Reorder Point={r[rec]['reorder_point']}, Cost=${r[rec]['total_cost']:,.0f}\n"
+
+        context += "\nALL SKUs SUMMARY:\n"
+        for sku_id, r in all_results.items():
+            row = df[df["SKU_ID"] == sku_id].iloc[0]
+            rec = r["recommended"]
+            context += f"- {sku_id} ({row['Product_Name']}): Recommended={rec}, EOQ={r[rec]['eoq']}, SS={r[rec]['safety_stock']}, ROP={r[rec]['reorder_point']}, Cost=${r[rec]['total_cost']:,.0f}, Risk={r['risk_score']}\n"
+
+        messages = [
+            {
+                "role": "system",
+                "content": f"""You are a senior pharmaceutical supply chain analyst assistant.
+You have access to the user's complete inventory data. Answer questions specifically using their data.
+Be concise, specific, and actionable. Always reference actual SKU IDs and numbers from the data.
+
+{context}"""
+            }
+        ]
+
+        # Add conversation history
+        for msg in conversation_history:
+            messages.append(msg)
+
+        # Add current question
+        messages.append({"role": "user", "content": question})
+
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            temperature=0.3,
+            max_tokens=800
+        )
+        return response.choices[0].message.content
+
+    except Exception as e:
+        return f"Error: {str(e)}"
+
 # ════════════════════════════════════════════
 # MAIN APP
 # ════════════════════════════════════════════
@@ -807,17 +860,74 @@ with tab3:
         all_results = st.session_state["all_results"]
         df          = st.session_state["df"]
 
+        # ── Privacy notice
+        st.markdown("""
+<div style="background:#1a1a2e;border:1px solid #333;border-radius:8px;padding:0.8rem 1rem;margin-bottom:1rem;font-size:0.82rem;color:#aaa;">
+🔒 <strong style="color:#ccc;">Privacy Notice:</strong> Your data is processed locally and never stored.
+AI analysis sends summarised metrics (not raw data) to Groq for processing.
+No data is retained after your session ends. Closing this tab permanently deletes all data.
+</div>
+""", unsafe_allow_html=True)
+
+        # ── AI Portfolio Analysis
         st.markdown('<p class="section-header">AI Portfolio Analysis</p>', unsafe_allow_html=True)
         st.markdown("Click below to get an AI-powered analysis of your entire inventory portfolio — risks, opportunities, and immediate actions.")
 
         if st.button("🤖 Generate AI Analysis"):
             with st.spinner("AI is analysing your portfolio..."):
                 ai_output = get_ai_analysis(all_results, df)
-                st.session_state["ai_output"] = ai_output
+                st.session_state["ai_output"]       = ai_output
+                st.session_state["chat_history"]    = []
+                st.session_state["chat_messages"]   = []
 
         if "ai_output" in st.session_state:
             st.markdown(st.session_state["ai_output"])
 
+            # ── Chat section
+            st.markdown('<p class="section-header">💬 Ask Follow-up Questions</p>', unsafe_allow_html=True)
+            st.markdown("Ask anything about your inventory data — specific SKUs, reorder decisions, risk explanations, cost savings, and more.")
+
+            # Show chat history
+            if "chat_messages" not in st.session_state:
+                st.session_state["chat_messages"] = []
+            if "chat_history" not in st.session_state:
+                st.session_state["chat_history"]  = []
+
+            for msg in st.session_state["chat_messages"]:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+
+            # Chat input
+            if prompt := st.chat_input("Ask a question about your inventory... e.g. Which SKU should I reorder first?"):
+                # Show user message
+                st.session_state["chat_messages"].append({"role": "user", "content": prompt})
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+
+                # Get AI response
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        client   = Groq(api_key=GROQ_API_KEY)
+                        response = get_chat_response(
+                            client, prompt,
+                            st.session_state["chat_history"],
+                            all_results, df
+                        )
+                        st.markdown(response)
+
+                # Save to history
+                st.session_state["chat_messages"].append({"role": "assistant", "content": response})
+                st.session_state["chat_history"].append({"role": "user",      "content": prompt})
+                st.session_state["chat_history"].append({"role": "assistant", "content": response})
+
+            # Clear chat button
+            if st.session_state.get("chat_messages"):
+                if st.button("🗑️ Clear Chat History"):
+                    st.session_state["chat_messages"] = []
+                    st.session_state["chat_history"]  = []
+                    st.rerun()
+
+        # ── Download
         st.markdown('<p class="section-header">Download Full Report</p>', unsafe_allow_html=True)
         st.markdown("Download a complete Excel report with 5 organized sheets — summary dashboard, high risk SKUs, cost analysis, reorder schedule, and scenario comparison.")
 
