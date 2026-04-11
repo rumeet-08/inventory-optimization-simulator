@@ -31,8 +31,13 @@ html, body, [class*="css"] {
 #MainMenu { visibility: hidden; }
 footer { visibility: hidden; }
 header { visibility: hidden; }
-.block-container { padding: 0 !important; max-width: 100% !important; }
+.block-container { 
+    padding: 1rem 1rem 1rem 1rem !important; 
+    max-width: 100% !important; 
+}
 .stApp { background: #111827 !important; }
+.stApp > div { background: #111827 !important; }
+section[data-testid="stSidebar"] { display: none; }
 
 /* Top header bar */
 .top-header {
@@ -258,7 +263,7 @@ div[data-testid="stTabs"] [aria-selected="true"] {
 }
 div[data-testid="stTabs"] [data-baseweb="tab-panel"] {
     background: #111827 !important;
-    padding: 0 !important;
+    padding: 8px 0 !important;
 }
 div[data-testid="stFileUploader"] {
     background: #111827 !important;
