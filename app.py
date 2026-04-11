@@ -572,7 +572,51 @@ def generate_template():
         cell.value     = col
 
     samples = [
-        ["SKU-001","Product A",4200,5.00,200,14,1,78,95,22,2.0,15,3,100,1095,200,"Stable",1.0],
-        ["SKU-002","Product B",3100,8.50,180,21,2,88,95,22,2.0,12,4,50,730,0,"Rising",1.3],
-        ["SKU-003","Product C",890,45.00,350,30,1,72,99,22,2.5,5,5,20,180,50,"Stable",1.0],
-        ["SKU-004", "Product D", 5600, 3.20, 150, 18, 3
+        ["SKU-001", "Product A", 4200, 5.00, 200, 14, 1, 78, 95, 22, 2.0, 15, 3, 100, 1095, 200, "Stable", 1.0],
+        ["SKU-002", "Product B", 3100, 8.50, 180, 21, 2, 88, 95, 22, 2.0, 12, 4, 50, 730, 0, "Rising", 1.3],
+        ["SKU-003", "Product C", 890, 45.00, 350, 30, 1, 72, 99, 22, 2.5, 5, 5, 20, 180, 50, "Stable", 1.0],
+        ["SKU-004", "Product D", 5600, 3.20, 150, 18, 3, 92, 90, 22, 1.8, 20, 4, 200, 1825, 0, "Falling", 1.0],
+        ["SKU-005", "Product E", 2400, 12.00, 220, 25, 1, 65, 99, 22, 2.0, 10, 6, 50, 730, 300, "Rising", 1.5],
+    ]
+    for s in samples:
+        ws.append(s)
+
+    for col in ws.columns:
+        max_len = max((len(str(c.value)) if c.value else 0) for c in col)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 28)
+
+    ws2 = wb.create_sheet("Instructions")
+    ws2["A1"] = "HOW TO FILL THE TEMPLATE"
+    ws2["A1"].font = Font(bold=True, size=13, color="818cf8")
+    instructions = [
+        ("",""),("INDIGO columns","REQUIRED — must fill for every product"),
+        ("ORANGE columns","OPTIONAL — leave blank, app uses smart defaults"),("",""),
+        ("SKU_ID","Unique product code e.g. SKU-001"),
+        ("Product_Name","Name of the product"),
+        ("Monthly_Demand","Units sold per month"),
+        ("Unit_Cost_USD","Cost per unit in USD"),
+        ("Order_Cost_USD","Cost to place one order (admin + shipping)"),
+        ("Lead_Time_Days","Average days supplier takes to deliver"),
+        ("Num_Suppliers","Number of suppliers (1, 2, 3...)"),
+        ("Supplier_Reliability_Pct","% of orders delivered on time (0-100)"),
+        ("Service_Level_Pct","Target service level: 90, 95, 97, or 99"),("",""),
+        ("Working_Days_Month","Working days per month (default: 22)"),
+        ("Monthly_Holding_Cost_Pct","Monthly storage cost % of unit cost (default: 2%)"),
+        ("Demand_Std_Dev","Daily demand std deviation (default: 20% of daily demand)"),
+        ("Lead_Time_Std_Dev","Lead time std deviation in days (default: 20% of lead time)"),
+        ("MOQ","Minimum order quantity (default: none)"),
+        ("Shelf_Life_Days","Product shelf life in days (default: no limit)"),
+        ("Dead_Stock_Units","Units currently sitting idle (default: 0)"),
+        ("Price_Trend","Rising / Stable / Falling (default: Stable)"),
+        ("Peak_Season_Multiplier","Demand multiplier in peak e.g. 1.8 (default: 1.0)"),
+        ("",""),("MAX SKUs","Up to 500 products per upload"),
+    ]
+    for r in instructions:
+        ws2.append(list(r))
+    ws2.column_dimensions["A"].width = 26
+    ws2.column_dimensions["B"].width = 52
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
